@@ -1,0 +1,1 @@
+{"name":"@playhub/console","private":true,"scripts":{"dev":"next dev -H 0.0.0.0","build":"next build","start":"node .next/standalone/frontend/playhub-console/server.js"},"dependencies":{"next":"latest","react":"latest","react-dom":"latest","lucide-react":"latest"},"devDependencies":{"@types/node":"latest","@types/react":"latest","@types/react-dom":"latest","typescript":"latest"}}

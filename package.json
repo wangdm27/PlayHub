@@ -1,0 +1,16 @@
+{
+  "name": "playhub",
+  "private": true,
+  "workspaces": [
+    "frontend/playhub-web",
+    "frontend/playhub-console",
+    "frontend/playhub-sdk",
+    "games/pool-game"
+  ],
+  "scripts": {
+    "web": "npm run dev -w frontend/playhub-web",
+    "console": "npm run dev -w frontend/playhub-console",
+    "game": "npm run dev -w games/pool-game",
+    "build": "npm run build -w frontend/playhub-sdk && npm run build -w frontend/playhub-web && npm run build -w frontend/playhub-console && npm run build -w games/pool-game"
+  }
+}
