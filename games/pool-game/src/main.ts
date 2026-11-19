@@ -6,6 +6,9 @@
 //   PlayHub SDK → postMessage 协议（game_loading_completed / game_over），平台契约勿动
 import Phaser from "phaser";
 import { World, Vec2, Circle, Edge, type Body } from "planck";
+import { PlayHubSDK } from "@playhub/sdk";
+
+const playhub = new PlayHubSDK(); void playhub.init(); // 宿主通信（无 await，同步完成 target 赋值）
 
 // ============ 常量 ============
 
@@ -349,10 +352,7 @@ class PoolScene extends Phaser.Scene {
       );
       if (allStill) {
         this.shot = false;
-        window.parent?.postMessage(
-          { source: "playhub-game", sdkVersion: "1.0.0", type: "game_over", data: { score: this.score } },
-          "*",
-        );
+        playhub.gameOver({ score: this.score });
       }
     }
   }
@@ -550,4 +550,4 @@ new Phaser.Game({
 });
 
 // 通知宿主平台：游戏加载完成（SDK 契约，勿动）
-window.parent?.postMessage({ source: "playhub-game", sdkVersion: "1.0.0", type: "game_loading_completed", data: {} }, "*");
+playhub.loadingComplete();
