@@ -26,6 +26,16 @@ const pockets = [
   { x: 70, y: 650 }, { x: 640, y: 666 }, { x: 1210, y: 650 },
 ];
 
+// ============ 旋量层（跟/缩/塞） ============
+// Planck 是俯视 2D 引擎：左/右塞（绕竖直轴 ωz，在桌面平面内）直接喂角速度，
+// 碰库变向由库边摩擦自然算出；跟/缩杆（垂直桌面轴）2D 引擎表达不了，
+// 用"接触点等效速度 s"手动积分模拟，物理结论来自真实台球动力学：
+//   接触点速度 u = v + s；滑动摩擦使 u 以 3.5×v 的速率衰减（滑动→纯滚自动转换）
+//   缩杆 = 白球撞球后 v≈0 而 s 仍在 → 摩擦把球往回推（真物理回退，非脚本）
+const SPIN_UI = { cx: W - 110, cy: 120, r: 40 }; // 击球点选择盘（HUD 右上角）
+const SLIDE_A = 180;    // 滑动摩擦减速度 px/s²（真实 ≈ μ·g ≈ 0.2×9.8×100 ≈ 200）
+const MAX_SPIN = 0.8;   // 击球点归一化上限（±0.8，避免滑杆失误区）
+
 /** 球色：0 白球，1-7 纯色，8 黑，9-15 条纹（复用 1-7 的色相） */
 const PALETTE = ["#f4ca38", "#1e72cf", "#d64b55", "#7a45ba", "#f09531", "#22a96b", "#6b3e26"]; // 黄 蓝红 紫 橙 绿 棕
 function ballColor(n: number) {
@@ -40,6 +50,10 @@ type BallMeta = {
   number: number;
   color: string;
   pocketed: boolean;
+  /** 旋量等效接触速度（px/s）：跟/缩杆载体，u = v + spin；左/右塞走 body 角速度 */
+  spin: { x: number; y: number };
+  /** 视觉滚动角（rad）：平滚时纹理转动，弥补引擎看不到垂直轴滚动 */
+  visualRoll: number;
 };
 
 // ============ 游戏场景 ============
@@ -60,8 +74,14 @@ class PoolScene extends Phaser.Scene {
   private strikePull = 0;
   private lastShotAng = 0;
 
+  // 旋量层：击球点选择（跟/缩/塞）
+  private spinPt = { x: 0, y: 0 };    // 击球点在盘上的位置（UI 像素，相对盘心）
+  private spinDragging = false;       // 正在拖击球点（此按下不触发瞄准）
+  private spinLabel!: Phaser.GameObjects.Text;
+
   // 渲染对象
-  private gfx!: Phaser.GameObjects.Graphics; // 瞄准层（每帧重绘）
+  private gfx!: Phaser.GameObjects.Graphics;      // 瞄准层（每帧重绘）
+  private shadowGfx!: Phaser.GameObjects.Graphics; // 投影层（每帧重绘，球下方）
   private scoreText!: Phaser.GameObjects.Text;
 
   // 固定步长累加器：物理固定 120Hz，不随帧率波动
@@ -76,11 +96,18 @@ class PoolScene extends Phaser.Scene {
   create() {
     this.buildStaticTable();          // 台面/木框/袋口（静态，画一次）
     this.buildPhysics();              // Planck 世界 + 库边 + 16 球
+    this.shadowGfx = this.add.graphics().setDepth(0); // 投影层：球下、台面上
     this.gfx = this.add.graphics();   // 瞄准层置顶
     this.gfx.setDepth(10);
     this.scoreText = this.add.text(92, 36, "Score 0", {
       fontFamily: "sans-serif", fontSize: "24px", fontStyle: "bold", color: "#ffffff",
     }).setOrigin(0, 0.5).setDepth(11);
+
+    // 击球点标签（盘下方）
+    this.spinLabel = this.add.text(SPIN_UI.cx, SPIN_UI.cy + SPIN_UI.r + 18, "", {
+      fontFamily: "sans-serif", fontSize: "14px", color: "#ffe9a8",
+    }).setOrigin(0.5).setDepth(11);
+
     this.bindInput();
   }
 
@@ -155,20 +182,21 @@ class PoolScene extends Phaser.Scene {
       restitution: 0.93,     // 真实球-球恢复系数 ≈ 0.93-0.98
     });
 
-    const sprite = this.add.image(x, y, key).setOrigin(0.5).setDepth(0);
-    const meta: BallMeta = { body, sprite, number: n, color: ballColor(n), pocketed: false };
+    const sprite = this.add.image(x, y, key).setOrigin(0.5).setDepth(1);
+    const meta: BallMeta = { body, sprite, number: n, color: ballColor(n), pocketed: false, spin: { x: 0, y: 0 }, visualRoll: 0 };
     this.balls.push(meta);
     return meta;
   }
 
-  /** 用 Canvas 画球纹理（一次生成，条纹/编号随 sprite.rotation 旋转） */
+  /** 用 Canvas 画球纹理（一次生成）：底色/条纹 → 编号 → 球面明暗 → 高光 */
   private makeBallTexture(key: string, n: number) {
     const tex = this.textures.createCanvas(key, radius * 2 + 4, radius * 2 + 4)!;
     const c = tex.getContext();
     const color = ballColor(n);
     c.translate(radius + 2, radius + 2);
+
+    // 底色层：1-8 纯色 / 9-15 白底色带
     if (n >= 9) {
-      // 条纹球：裁剪圆形后画白底 + 中部横向色带
       c.save();
       c.beginPath(); c.arc(0, 0, radius, 0, Math.PI * 2); c.clip();
       c.fillStyle = "#f7f5e9"; c.fillRect(-radius, -radius, radius * 2, radius * 2);
@@ -177,14 +205,31 @@ class PoolScene extends Phaser.Scene {
     } else {
       c.beginPath(); c.fillStyle = color; c.arc(0, 0, radius, 0, Math.PI * 2); c.fill();
     }
-    c.beginPath(); c.strokeStyle = "#eae8da"; c.lineWidth = 1;
-    c.arc(0, 0, radius, 0, Math.PI * 2); c.stroke();
+
+    // 编号小白点（画在明暗层下面，让阴影也压在号上 → 更立体）
     if (n > 0) {
       c.beginPath(); c.fillStyle = "#f7f5e9"; c.arc(0, -5, 6, 0, Math.PI * 2); c.fill();
       c.fillStyle = "#151515"; c.font = "bold 8px sans-serif";
       c.textAlign = "center"; c.textBaseline = "middle";
       c.fillText(String(n), 0, -5);
     }
+
+    // 球面明暗：径向渐变，左上受光、右下背光（画在最上层把整球压立体）
+    const shade = c.createRadialGradient(-radius * 0.45, -radius * 0.5, radius * 0.15, 0, 0, radius * 1.05);
+    shade.addColorStop(0, "rgba(255,255,255,0.40)");
+    shade.addColorStop(0.5, "rgba(255,255,255,0)");
+    shade.addColorStop(1, "rgba(0,0,0,0.30)");
+    c.beginPath(); c.arc(0, 0, radius, 0, Math.PI * 2); c.fillStyle = shade; c.fill();
+
+    // 镜面高光：左上小亮斑
+    const hi = c.createRadialGradient(-radius * 0.42, -radius * 0.55, 0, -radius * 0.42, -radius * 0.55, radius * 0.5);
+    hi.addColorStop(0, "rgba(255,255,255,0.95)");
+    hi.addColorStop(1, "rgba(255,255,255,0)");
+    c.beginPath(); c.arc(0, 0, radius, 0, Math.PI * 2); c.fillStyle = hi; c.fill();
+
+    // 描边收尾
+    c.beginPath(); c.strokeStyle = "#eae8da"; c.lineWidth = 1;
+    c.arc(0, 0, radius, 0, Math.PI * 2); c.stroke();
     tex.refresh();
   }
 
@@ -192,15 +237,32 @@ class PoolScene extends Phaser.Scene {
 
   private bindInput() {
     // Phaser 指针坐标已是 1280x720 游戏坐标（Scale.FIT 自动换算）
+    // 指针监听目标在 game config 里升级到 window（见启动配置），黑边内拖拽不断流
     this.input.on("pointerdown", (p: Phaser.Input.Pointer) => {
+      // 点在击球盘上 → 进入击球点编辑（此按下不进入瞄准）
+      if (Math.hypot(p.worldX - SPIN_UI.cx, p.worldY - SPIN_UI.cy) <= SPIN_UI.r + 8) {
+        this.spinDragging = true;
+        this.updateSpinPoint(p.worldX, p.worldY);
+        return;
+      }
       if (this.shot) return;
       this.pointer = { x: p.worldX, y: p.worldY, down: true };
     });
     this.input.on("pointermove", (p: Phaser.Input.Pointer) => {
+      if (this.spinDragging) {
+        this.updateSpinPoint(p.worldX, p.worldY);
+        return;
+      }
       this.pointer.x = p.worldX;
       this.pointer.y = p.worldY;
     });
-    this.input.on("pointerup", () => this.tryStrike());
+    this.input.on("pointerup", () => {
+      if (this.spinDragging) {
+        this.spinDragging = false;
+        return;
+      }
+      this.tryStrike();
+    });
 
     // 切走页面时松手，避免卡在瞄准态
     document.addEventListener("visibilitychange", () => {
@@ -208,9 +270,19 @@ class PoolScene extends Phaser.Scene {
     });
   }
 
+  /** 拖动击球点：限制在盘心 0.8 半径内（避免滑杆失误区） */
+  private updateSpinPoint(wx: number, wy: number) {
+    let dx = wx - SPIN_UI.cx, dy = wy - SPIN_UI.cy;
+    const d = Math.hypot(dx, dy);
+    const max = MAX_SPIN * SPIN_UI.r;
+    if (d > max) { dx = dx / d * max; dy = dy / d * max; }
+    this.spinPt.x = dx;
+    this.spinPt.y = dy;
+  }
+
   /** 松手击球：力度 = 拉离白球距离/7（上限 18），朝反方向发射（拉弹弓） */
   private tryStrike() {
-    if (!this.pointer.down || this.shot || this.cueBall.pocketed) return;
+    if (!this.pointer.down || this.shot || this.cueBall.pocketed || this.spinDragging) return;
     this.pointer.down = false;
     const cuePos = this.cueBall.body.getPosition();
     const dx = pu(cuePos.x) - this.pointer.x, dy = pu(cuePos.y) - this.pointer.y;
@@ -219,10 +291,21 @@ class PoolScene extends Phaser.Scene {
 
     const a = Math.atan2(dy, dx);
     this.lastShotAng = a;
-    // 1 px/帧 = 60 px/s = 60/PPM 物理单位/s；满力 18 → 1080px/s → 10.8 单位/s
+    const ux = Math.cos(a), uy = Math.sin(a);
+
+    // 注入旋量：
+    //   纵向偏移 f（上=跟杆 +f，下=缩杆 −f）→ 接触点等效速度 s = −f·|v|·方向
+    //   横向偏移 e（右=右塞 +e，左=左塞 −e）→ body 角速度 ωz（引擎碰库自然变向）
+    const e = this.spinPt.x / SPIN_UI.r;
+    const f = -this.spinPt.y / SPIN_UI.r;
+    const v0 = power * 60; // px/s
+    this.cueBall.spin.x = -f * v0 * ux;
+    this.cueBall.spin.y = -f * v0 * uy;
     this.cueBall.body.setAwake(true);
+    this.cueBall.body.setAngularVelocity(e * 30 * (power / 18)); // 满力满塞 ≈ 30 rad/s
+    // 1 px/帧 = 60 px/s = 60/PPM 物理单位/s；满力 18 → 1080px/s → 10.8 单位/s
     this.cueBall.body.setLinearVelocity(
-      new Vec2(Math.cos(a) * power * 60 / PPM, Math.sin(a) * power * 60 / PPM),
+      new Vec2(ux * power * 60 / PPM, uy * power * 60 / PPM),
     );
     this.shot = true;
 
@@ -241,9 +324,10 @@ class PoolScene extends Phaser.Scene {
 
   // ---------- 物理步进与游戏规则 ----------
 
-  /** 固定 1/120s 调一次：引擎求解碰撞，这里做进袋判定和回合结束检测 */
+  /** 固定 1/120s 调一次：引擎求解碰撞，这里做旋量积分/进袋判定/回合结束检测 */
   private step(dt: number) {
-    this.world.step(dt, 8, 3); // 8 次速度迭代 + 3 次位置迭代（Box2D 推荐值）
+    this.integrateSpin(dt);    // 旋量层：先手动积分（跟/缩杆），引擎再求解碰撞
+    this.world.step(dt, 8, 3); // 8 次速度迭代 + 3 次位置迭代（Box2D 精确迭代参数）
 
     // 进袋判定：引擎负责"到袋口之前"的一切运动，进袋仍用距离判定
     for (const m of this.balls) {
@@ -273,6 +357,43 @@ class PoolScene extends Phaser.Scene {
     }
   }
 
+  /**
+   * 旋量层积分（跟/缩杆）：手动模拟 2D 引擎表达不了的垂直轴旋转
+   * 每步：u = v + s；摩擦让 u 以 3.5×v 的速率衰减（真实结论：
+   * dv/dt = −a·û，ds/dt = −2.5a·û，合计 |u| 衰减 3.5a）
+   * 收敛后 s 置零 = 进入纯滚动；缩杆回退 = 撞球后 v≈0 而 s 仍在，
+   * u = s 反向 → 摩擦沿 −û 推球倒退（物理回退，非脚本）
+   */
+  private integrateSpin(dt: number) {
+    for (const m of this.balls) {
+      if (m.pocketed) continue;
+      const s = m.spin;
+      if (s.x === 0 && s.y === 0) continue;
+      if (!m.body.isAwake()) { m.spin.x = 0; m.spin.y = 0; continue; }
+
+      const vel = m.body.getLinearVelocity();
+      const v = { x: pu(vel.x), y: pu(vel.y) };
+      const u = { x: v.x + s.x, y: v.y + s.y };
+      const um = Math.hypot(u.x, u.y);
+      if (um < 2) { // |u| 足够小 → 已进入纯滚动，丢弃残余旋量
+        m.spin.x = 0; m.spin.y = 0;
+        continue;
+      }
+      const axn = u.x / um, ayn = u.y / um; // 滑动摩擦方向（−û）
+      const d = SLIDE_A * dt;
+      const nvx = v.x - axn * d, nvy = v.y - ayn * d; // v 衰减 a
+      // s 衰减 2.5a（合计 u 衰减 3.5a）；过冲则收敛置零
+      let nsx = s.x - axn * d * 2.5, nsy = s.y - ayn * d * 2.5;
+      const u2x = nvx + nsx, u2y = nvy + nsy;
+      if (u2x * u.x + u2y * u.y <= 0) {
+        m.spin.x = 0; m.spin.y = 0;
+      } else {
+        m.spin.x = nsx; m.spin.y = nsy;
+      }
+      m.body.setLinearVelocity(new Vec2(px(nvx), px(nvy)));
+    }
+  }
+
   /** 球进袋：彩球缩小消失并计分，白球重置回开球点 */
   private captureBall(m: BallMeta) {
     m.pocketed = true;
@@ -280,10 +401,12 @@ class PoolScene extends Phaser.Scene {
     m.body.setAngularVelocity(0);
     m.body.setActive(false); // 从物理世界摘除（不再参与碰撞）
     if (m.number === 0) {
-      // 白球进袋 → 重置回开球点，继续用
+      // 白球进袋 → 重置回开球点，继续用（旋量也清零）
       m.body.setPosition(new Vec2(px(330), px(360)));
       m.body.setActive(true);
       m.pocketed = false;
+      m.spin.x = 0; m.spin.y = 0;
+      m.body.setAngularVelocity(0);
       m.sprite.setPosition(330, 360).setVisible(true).setAlpha(1).setScale(1);
     } else {
       // 彩球计分：8 号 50 分，其余 10 分；精灵缩小淡出动画
@@ -307,17 +430,25 @@ class PoolScene extends Phaser.Scene {
       this.step(1 / 120);
       this.acc -= 1 / 120;
     }
-    this.syncSprites();
+    this.syncSprites(dt);
     this.drawAim();
   }
 
-  /** 每帧把物理刚体的位置/角度同步到精灵 */
-  private syncSprites() {
+  /** 每帧：滚动角累积 + 物理位置/角度同步到精灵 + 画投影 */
+  private syncSprites(dt: number) {
+    this.shadowGfx.clear();
+    this.shadowGfx.fillStyle(0x000000, 0.28);
     for (const m of this.balls) {
       if (m.pocketed) continue;
       const pos = m.body.getPosition();
-      m.sprite.setPosition(pu(pos.x), pu(pos.y));
-      m.sprite.rotation = m.body.getAngle();
+      const x = pu(pos.x), y = pu(pos.y);
+      // 视觉滚动：平滚距离/半径 累积旋转角（引擎只看得见 ωz 自旋，垂直轴滚动补视觉）
+      const vel = m.body.getLinearVelocity();
+      m.visualRoll += Math.hypot(pu(vel.x), pu(vel.y)) * dt / radius;
+      m.sprite.setPosition(x, y);
+      m.sprite.rotation = m.body.getAngle() + m.visualRoll;
+      // 投影：光从左上 → 影在右下，扁椭圆
+      this.shadowGfx.fillEllipse(x + 3, y + 4.5, radius * 2 - 2, radius * 2 - 5);
     }
   }
 
@@ -326,6 +457,27 @@ class PoolScene extends Phaser.Scene {
   private drawAim() {
     const g = this.gfx;
     g.clear();
+
+    // 击球点选择盘（HUD 右上角）：白球面 + 十字线 + 红点 + 效果标签
+    const SP = SPIN_UI;
+    g.lineStyle(2, 0xffffff, 0.45);
+    g.strokeCircle(SP.cx, SP.cy, SP.r);
+    g.lineStyle(1, 0xffffff, 0.15);
+    g.beginPath(); g.moveTo(SP.cx - SP.r, SP.cy); g.lineTo(SP.cx + SP.r, SP.cy); g.strokePath();
+    g.beginPath(); g.moveTo(SP.cx, SP.cy - SP.r); g.lineTo(SP.cx, SP.cy + SP.r); g.strokePath();
+    g.fillStyle(0xf7f7ee, 0.9);
+    g.fillCircle(SP.cx, SP.cy, SP.r - 2);
+    g.fillStyle(0x1a8165, 0.15);
+    g.fillCircle(SP.cx, SP.cy, SP.r - 2);
+    g.fillStyle(0xd64b55, 1);
+    g.fillCircle(SP.cx + this.spinPt.x, SP.cy + this.spinPt.y, 5);
+    const f = -this.spinPt.y / SPIN_UI.r, e = this.spinPt.x / SPIN_UI.r;
+    let txt = "中杆";
+    if (f > 0.15) txt = "跟杆 ↑";
+    else if (f < -0.15) txt = "缩杆 ↓";
+    if (Math.abs(e) > 0.15) txt += e > 0 ? "  右塞 →" : "  ← 左塞";
+    this.spinLabel.setText(txt);
+
     if (this.cueBall.pocketed) return;
     const cuePosV = this.cueBall.body.getPosition();
     const cue = { x: pu(cuePosV.x), y: pu(cuePosV.y) };
@@ -387,6 +539,12 @@ new Phaser.Game({
   scale: {
     mode: Phaser.Scale.FIT,            // 等比缩放铺满容器，替代手写 resize/dpr
     autoCenter: Phaser.Scale.CENTER_BOTH,
+  },
+  input: {
+    // 指针监听挂到整个窗口：Scale.FIT 的黑边不是画布，
+    // 默认只听 canvas 时拖出画布事件断流（拉杆冻住、使不上劲）
+    mouse: { target: window },
+    touch: { target: window },
   },
   scene: PoolScene,
 });
